@@ -14,7 +14,9 @@ use crate::tool_calling::scan::{
     InvokeBoundaryFactory, InvokeEmitter, InvokeLatch, WrappedBlockScanner, WrappedBlockSpec,
 };
 use crate::tool_calling::traits::{Tool, ToolCallDelta, ToolParseResult, ToolParser};
-use crate::unified::{UnifiedParser, UnifiedParserExt};
+use crate::unified::{
+    UnifiedParser, UnifiedParserExt, UnifiedParserInit, UnifiedParserStartingState, deepseek_v41,
+};
 
 pub(crate) const BLOCK_START: &str = "<｜DSML｜tool_calls>";
 pub(crate) const BLOCK_END: &str = "</｜DSML｜tool_calls>";
@@ -24,31 +26,57 @@ pub(crate) const PARAMETER_PREFIX: &str = "<｜DSML｜parameter name=";
 pub(crate) const PARAMETER_END: &str = "</｜DSML｜parameter>";
 
 pub(crate) fn deepseek_v4_scanner(_tools: &[Tool]) -> WrappedBlockScanner<DsmlEmitter> {
-    WrappedBlockScanner::new(
-        WrappedBlockSpec {
-            family: "deepseek_v4",
-            block_starts: vec![BLOCK_START.to_string()],
-            block_ends: vec![BLOCK_END.to_string()],
-            invoke_start: INVOKE_START_PREFIX.to_string(),
-            invoke_end: INVOKE_END.to_string(),
-            orphan_markers: vec![BLOCK_END.to_string(), INVOKE_END.to_string()],
-            holdback_markers: vec![
-                BLOCK_START.to_string(),
-                BLOCK_END.to_string(),
-                INVOKE_START_PREFIX.to_string(),
-                INVOKE_END.to_string(),
-                PARAMETER_PREFIX.to_string(),
-                PARAMETER_END.to_string(),
-            ],
-            bare_recovery_latch: BareRecoveryLatch::Set,
-            invoke_latch: InvokeLatch::IfEmitted,
-            // A DSML block may omit its outer close after a complete invoke.
-            drop_invoke_crossing_block_end: false,
-            invoke_boundary_factory: Some(InvokeBoundaryFactory::custom(dsml_invoke_boundary)),
-            preserve_special_tokens: true,
-        },
-        DsmlEmitter,
-    )
+    dsml_scanner(false)
+}
+
+/// Tool-only compatibility accepts both native DSML dialects through one scanner.
+pub(crate) fn deepseek_tool_scanner() -> WrappedBlockScanner<DsmlEmitter> {
+    dsml_scanner(true)
+}
+
+fn dsml_scanner(both_dialects: bool) -> WrappedBlockScanner<DsmlEmitter> {
+    let mut spec = WrappedBlockSpec {
+        family: "deepseek_v4",
+        block_starts: vec![BLOCK_START.to_string()],
+        block_ends: vec![BLOCK_END.to_string()],
+        invoke_start: INVOKE_START_PREFIX.to_string(),
+        invoke_end: INVOKE_END.to_string(),
+        orphan_markers: vec![BLOCK_END.to_string(), INVOKE_END.to_string()],
+        holdback_markers: vec![
+            BLOCK_START.to_string(),
+            BLOCK_END.to_string(),
+            INVOKE_START_PREFIX.to_string(),
+            INVOKE_END.to_string(),
+            PARAMETER_PREFIX.to_string(),
+            PARAMETER_END.to_string(),
+        ],
+        bare_recovery_latch: BareRecoveryLatch::Set,
+        invoke_latch: InvokeLatch::IfEmitted,
+        // A DSML block may omit its outer close after a complete invoke.
+        drop_invoke_crossing_block_end: false,
+        invoke_boundary_factory: Some(InvokeBoundaryFactory::custom(dsml_invoke_boundary)),
+        preserve_special_tokens: true,
+    };
+    if both_dialects {
+        spec.block_starts.push(deepseek_v41::BLOCK_START.into());
+        spec.block_ends.push(deepseek_v41::BLOCK_END.into());
+        // Both invocation openers share this anchor; the boundary's opens()
+        // distinguishes complete invocation headers from other DSML markup.
+        spec.invoke_start = "<｜DSML｜".into();
+        spec.orphan_markers.extend([
+            deepseek_v41::BLOCK_END.into(),
+            deepseek_v41::INVOKE_END.into(),
+        ]);
+        spec.holdback_markers.extend([
+            deepseek_v41::BLOCK_START.into(),
+            deepseek_v41::BLOCK_END.into(),
+            deepseek_v41::INVOKE_START.into(),
+            deepseek_v41::INVOKE_END.into(),
+            deepseek_v41::PARAMETER_START.into(),
+            deepseek_v41::PARAMETER_END.into(),
+        ]);
+    }
+    WrappedBlockScanner::new(spec, DsmlEmitter)
 }
 
 pub(crate) struct DsmlEmitter;
@@ -77,6 +105,9 @@ pub(crate) fn boundary_examined_bytes() -> usize {
 
 #[derive(Default)]
 struct DsmlInvokeBoundary {
+    // Delegate spaced invocations to the existing V4.1 grammar. Selection is
+    // per invocation, so parallel calls can use either dialect without rewriting data.
+    v41: Option<Box<dyn InvokeBoundary>>,
     candidate_len: usize,
     cursor: usize,
     mode: DsmlLexMode,
@@ -176,8 +207,14 @@ impl InvokeBoundary for DsmlInvokeBoundary {
         candidate: &str,
         append: &str,
         flush: bool,
-        _tool_index: usize,
+        tool_index: usize,
     ) -> Option<usize> {
+        if candidate.starts_with(deepseek_v41::INVOKE_START) {
+            return self
+                .v41
+                .get_or_insert_with(deepseek_v41::invocation_boundary)
+                .end_append(candidate, append, flush, tool_index);
+        }
         if candidate.len() != self.candidate_len + append.len() {
             self.reset();
         }
@@ -340,6 +377,7 @@ impl InvokeBoundary for DsmlInvokeBoundary {
 
     fn opens(&self, text: &str, at: usize) -> bool {
         text[at..].starts_with(INVOKE_START_PREFIX)
+            || text[at..].starts_with(deepseek_v41::INVOKE_START)
     }
 
     fn holdback(&self, text: &str) -> usize {
@@ -369,6 +407,9 @@ impl InvokeEmitter for DsmlEmitter {
         invoke: &str,
         tool_index: usize,
     ) -> anyhow::Result<Option<ToolCallDelta>> {
+        if invoke.starts_with(deepseek_v41::INVOKE_START) {
+            return deepseek_v41::DeepSeekV41.parse_invoke(invoke, tool_index);
+        }
         let Some((name, header_len)) = parse_invoke_header(invoke) else {
             return Ok(None);
         };
@@ -409,7 +450,8 @@ impl InvokeEmitter for DsmlEmitter {
     }
 }
 
-/// Compatibility adapter for callers that still need `ToolParseResult`.
+/// Compatibility adapter for V4 and V4.1 DSML through the `deepseek_v4` selector.
+/// Reasoning delimiters remain in normal text for callers to process.
 pub struct DeepSeekV4ToolStreamParser {
     parser: Box<dyn UnifiedParser>,
 }
@@ -420,9 +462,15 @@ impl DeepSeekV4ToolStreamParser {
     }
 
     pub fn new_with_tools(tools: &[Tool]) -> Self {
-        Self {
-            parser: crate::unified::deepseek_v4::deepseek_v4_unified(tools),
-        }
+        let mut parser = crate::unified::deepseek_v4::deepseek_tool_unified(tools);
+        // Tool-only callers own reasoning extraction and need its delimiters intact.
+        parser
+            .initialize_request(UnifiedParserInit {
+                starting_state: UnifiedParserStartingState::Response,
+                ..Default::default()
+            })
+            .expect("native response-mode initialization is valid");
+        Self { parser }
     }
 }
 
@@ -621,23 +669,28 @@ mod tests {
     }
 
     #[test]
-    fn legacy_parser_projects_the_unified_dsml_events() {
-        let input = "before<think>reason</think><｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\"><｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>after";
-        let split = input.find("<｜DSML｜tool_calls>").expect("DSML block");
-        let mut legacy = DeepSeekV4ToolStreamParser::default();
-        let mut legacy_result = legacy.push(&input[..split]).expect("legacy prefix");
-        legacy_result.append(legacy.push(&input[split..]).expect("legacy suffix"));
-        legacy_result.append(legacy.finish().expect("legacy finish"));
-
-        let mut unified = crate::unified::deepseek_v4::deepseek_v4_unified(&[]);
-        unified
-            .initialize_request(UnifiedParserInit::native(&[]))
-            .expect("initialize unified");
-        let mut unified_events = unified.push(&input[..split]).expect("unified prefix");
-        unified_events.extend(unified.push(&input[split..]).expect("unified suffix"));
-        unified_events.extend(unified.finish().expect("unified finish").events);
-
-        assert_eq!(ToolParseResult::from_deltas(unified_events), legacy_result);
+    fn tool_parser_preserves_reasoning_markers_for_the_caller() {
+        for prefix in ["before<think>reason</think>", "reason</think>\n\n"] {
+            let input = format!(
+                "{prefix}<｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\"><｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>after"
+            );
+            for split in input.char_indices().map(|(at, _)| at).chain([input.len()]) {
+                let mut parser = DeepSeekV4ToolStreamParser::default();
+                let mut result = parser.push(&input[..split]).expect("prefix");
+                result.append(parser.push(&input[split..]).expect("suffix"));
+                result.append(parser.finish().expect("finish"));
+                let result = result.coalesce_calls();
+                assert_eq!(
+                    result.normal_text,
+                    format!("{prefix}after"),
+                    "split {split}"
+                );
+                assert_eq!(result.calls.len(), 1);
+                assert_eq!(result.calls[0].name.as_deref(), Some("get_weather"));
+                assert_eq!(result.calls[0].arguments, r#"{"city":"Paris"}"#);
+                assert!(result.calls[0].complete);
+            }
+        }
     }
 
     #[test]
