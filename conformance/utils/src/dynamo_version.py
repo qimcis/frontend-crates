@@ -132,7 +132,6 @@ def source_fingerprint(repo_root: Path, revision: str | None = None) -> str:
 
 
 def dynamo_v2_provenance(repo_root: Path, override: str | None = None) -> dict:
-    """Deprecated producer protocol retained until the Rust harnesses migrate."""
     repo_root = repo_root.resolve()
     actual_root = Path(os.fsdecode(_git(repo_root, "rev-parse", "--show-toplevel")).strip())
     if actual_root != repo_root:
@@ -180,15 +179,12 @@ def dynamo_v2_provenance(repo_root: Path, override: str | None = None) -> dict:
 
 
 def dynamo_v2_label(repo_root: Path, override: str | None = None) -> str:
-    version = crate_version(repo_root / "parsers/v2/Cargo.toml")
-    supplied = override if override is not None else os.environ.get(ENV_OVERRIDE)
-    if supplied is not None and supplied.strip() not in ("current", version):
-        raise ValueError(f"capture version must be {version!r}, got {supplied!r}")
-    return version
+    provenance = dynamo_v2_provenance(repo_root, override)
+    return provenance["crate_version"]
 
 
 def select_capture_label(repo_root: Path, captures: dict) -> str:
-    """Deprecated Rust-only selector; normal readers use dynamo_v2_label."""
+    """Select the semantic current view, with read-only legacy-directory fallback."""
     current = dynamo_v2_provenance(repo_root)
     version = current["crate_version"]
     semantic_records = _capture_records(captures, version)
@@ -222,11 +218,7 @@ def select_capture_label(repo_root: Path, captures: dict) -> str:
         for label in captures
         if isinstance(label, str) and (match := patch_pattern.fullmatch(label))
     ]
-    if patches:
-        return max(patches)[1]
-    # An unpublished checkout without a semantic record cannot claim that a
-    # version-only directory was produced by its source.
-    return current["label"] if current["label"] != version else version
+    return max(patches)[1] if patches else version
 
 
 def validate_capture_provenance(repo_root: Path, recorded: dict) -> dict:
@@ -275,21 +267,17 @@ def _validate_provenance_origin(repo_root: Path, recorded: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[3])
-    parser.add_argument("--label", help="crate version or current; legacy JSON producer labels are deprecated")
+    parser.add_argument("--label", help="published version, current, or exact source-qualified label")
     parser.add_argument("--format", choices=("json", "label"), default="json")
-    parser.add_argument("--select-capture", action="store_true", help="deprecated Rust harness compatibility: read legacy capture inventory from stdin")
+    parser.add_argument("--select-capture", action="store_true", help="select a consumer label using capture provenance JSON on stdin")
     args = parser.parse_args()
     if args.select_capture:
         if args.label is not None or args.format != "label":
             parser.error("--select-capture requires --format label and no --label")
         print(select_capture_label(args.repo_root, json.load(sys.stdin)))
         return
-    if args.format == "label":
-        print(dynamo_v2_label(args.repo_root, args.label))
-    else:
-        # Rust producers still consume the old JSON protocol. Never use its label
-        # for filenames or report selection; explode writes the crate version.
-        print(json.dumps(dynamo_v2_provenance(args.repo_root, args.label), sort_keys=True))
+    provenance = dynamo_v2_provenance(args.repo_root, args.label)
+    print(json.dumps(provenance, sort_keys=True) if args.format == "json" else provenance["label"])
 
 
 if __name__ == "__main__":
