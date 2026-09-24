@@ -636,7 +636,7 @@ fn parse_tool_call_block(
     // (?s) enables dotall mode so (.*?) matches across newlines — required
     // because models often emit multi-line content in arg values.
     let pattern = format!(
-        r"(?s){}([^<]+){}{}(.*?){}",
+        r"(?s){}([^<]+){}\s*{}(.*?){}",
         arg_key_start_escaped, arg_key_end_escaped, arg_value_start_escaped, arg_value_end_escaped
     );
 
